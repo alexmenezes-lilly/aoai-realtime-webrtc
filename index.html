@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Azure OpenAI Realtime Voice</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .controls {
+            text-align: center;
+            margin: 20px 0;
+        }
+        button {
+            padding: 15px 30px;
+            margin: 10px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+        .start-btn {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .start-btn:hover {
+            background-color: #45a049;
+        }
+        .start-btn:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .stop-btn {
+            background-color: #f44336;
+            color: white;
+        }
+        .stop-btn:hover {
+            background-color: #da190b;
+        }
+        .stop-btn:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .status {
+            text-align: center;
+            margin: 20px 0;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .status.error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .transcription {
+            background-color: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 5px;
+            padding: 20px;
+            margin: 20px 0;
+            min-height: 100px;
+            white-space: pre-wrap;
+        }
+        .response {
+            background-color: #e7f3ff;
+            border: 1px solid #b3d9ff;
+            border-radius: 5px;
+            padding: 20px;
+            margin: 20px 0;
+            min-height: 100px;
+            white-space: pre-wrap;
+        }
+        .response h3 {
+            margin-top: 0;
+            color: #0066cc;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Azure OpenAI Realtime Voice</h1>
+        
+        <div class="status" id="status">
+            Ready to start session
+        </div>
+        
+        <div class="controls">
+            <button id="startBtn" class="start-btn">Start Session</button>
+        </div>
+        
+        <div>
+            <div style="margin-bottom: 10px; color: #666; font-style: italic;">Transcription will appear here...</div>
+            <div class="transcription" id="transcription"></div>
+        </div>
+        
+        <div class="controls">
+            <button id="stopBtn" class="stop-btn" disabled>Submit question</button>
+        </div>
+        
+        <div class="response" id="response" style="display: none;">
+            <h3>AI Response:</h3>
+            <div id="responseText">Response will appear here...</div>
+        </div>
+    </div>
+
+    <script>
+        class RealtimeVoiceApp {
+            constructor() {
+                this.isConnected = false;
+                this.ephemeralKey = null;
+                this.endpoint = null;                
+                this.peerConnection = null;
+                this.dataChannel = null;                
+                this.mediaStream = null;
+                
+                this.initializeElements();
+                this.setupEventListeners();
+            }
+            
+            initializeElements() {
+                this.status = document.getElementById('status');
+                this.transcription = document.getElementById('transcription');
+                this.startBtn = document.getElementById('startBtn');
+                this.stopBtn = document.getElementById('stopBtn');
+                this.response = document.getElementById('response');
+                this.responseText = document.getElementById('responseText');
+            }
+            
+            setupEventListeners() {
+                this.startBtn.addEventListener('click', () => {
+                    this.startSession();
+                });
+                
+                this.stopBtn.addEventListener('click', () => {
+                    this.stopSession();
+                });
+            }
+            
+            async startSession() {
+                try {
+                    this.startBtn.disabled = true;
+                    this.updateStatus('Initializing...', '');
+                    
+                    // Hide previous response when starting new session
+                    this.response.style.display = 'none';
+                    
+                    await this.initializeConnection();
+                    
+                    this.stopBtn.disabled = false;
+                    this.updateStatus('Connected and listening...', 'connected');
+                } catch (error) {
+                    console.error('Failed to start session:', error);
+                    this.updateStatus('Failed to connect: ' + error.message, 'error');
+                    this.startBtn.disabled = false;
+                }
+            }
+            
+            async stopSession() {
+                try {
+                    // Disable the stop button immediately to prevent double-clicks
+                    this.stopBtn.disabled = true;
+                    
+                    // Get transcription text before clearing
+                    const transcriptionText = this.transcription.textContent;
+                    
+                    // Send question to API if there's transcribed text
+                    if (transcriptionText && transcriptionText.trim() !== '') {
+                        this.updateStatus('Sending question to AI...', 'connected');
+                        await this.sendQuestionToAPI(transcriptionText);
+                    }
+                    
+                    // Close WebRTC connection (synchronous - happens immediately)
+                    if (this.peerConnection) {
+                        this.peerConnection.close();
+                        this.peerConnection = null;
+                    }
+                    
+                    // Close data channel
+                    if (this.dataChannel) {
+                        this.dataChannel.close();
+                        this.dataChannel = null;
+                    }
+                    
+                    // Stop media stream
+                    if (this.mediaStream) {
+                        this.mediaStream.getTracks().forEach(track => track.stop());
+                        this.mediaStream = null;
+                    }
+                    
+                    // Reset state
+                    this.isConnected = false;
+                    this.ephemeralKey = null;
+                    this.endpoint = null;
+                    
+                    // Clear transcription
+                    this.transcription.textContent = '';
+                    
+                    // Update UI
+                    this.startBtn.disabled = false;
+                    this.stopBtn.disabled = true;
+                    this.updateStatus('Session stopped. Ready to start new session', '');
+                    
+                } catch (error) {
+                    console.error('Error stopping session:', error);
+                    this.updateStatus('Error stopping session: ' + error.message, 'error');
+                    // Still reset UI even if API call failed
+                    this.startBtn.disabled = false;
+                    this.stopBtn.disabled = true;
+                }
+            }
+            
+            async sendQuestionToAPI(questionText) {
+                try {
+                    const response = await fetch('/api/send-question', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            text: questionText
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error('Failed to get AI response');
+                    }
+                    
+                    const data = await response.json();
+                    
+                    // Show the response
+                    this.responseText.textContent = data.answer;
+                    this.response.style.display = 'block';
+                    
+                    console.log('AI Response:', data);
+                    
+                } catch (error) {
+                    console.error('Error sending question:', error);
+                    this.responseText.textContent = 'Error getting AI response: ' + error.message;
+                    this.response.style.display = 'block';
+                }
+            }
+            
+            async initializeConnection() {
+                try {
+                    await this.getEphemeralKey();
+                    await this.setupWebRTC();
+                } catch (error) {
+                    console.error('Failed to initialize:', error);
+                    this.updateStatus('Failed to connect: ' + error.message, 'error');
+                }
+            }
+            
+            async getEphemeralKey() {
+                try {
+                    const response = await fetch('/api/ephemeral-key', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error('Failed to get ephemeral key');
+                    }
+                    
+                    const data = await response.json();
+                    this.ephemeralKey = data.token;
+                    this.endpoint = data.endpoint;                    
+                    console.log('Ephemeral key obtained: ', this.ephemeralKey);
+                } catch (error) {
+                    throw new Error('Failed to get ephemeral key: ' + error.message);
+                }
+            }
+            
+            async setupWebRTC() {
+                try {
+                    console.log('Setting up WebRTC connection...');                    
+                    // Create RTCPeerConnection with Azure OpenAI TURN server
+                    // Extract hostname from the WebRTC endpoint for TURN server                    
+                    const hostname = new URL(this.endpoint).hostname;
+                    
+                    console.log('Using TURN server hostname:', hostname);
+                    console.log('Using ephemeral key:', this.ephemeralKey);
+                    
+                    this.peerConnection = new RTCPeerConnection({
+                        iceServers: [{
+                            urls: `turn:${hostname}:3478`,
+                            username: 'webrtc',
+                            credential: this.ephemeralKey
+                        }]
+                    });
+
+                    // Set up event handlers
+                    this.peerConnection.oniceconnectionstatechange = () => {
+                        console.log('ICE connection state:', this.peerConnection.iceConnectionState);
+                        if (this.peerConnection.iceConnectionState === 'connected') {
+                            this.isConnected = true;
+                        }
+                    };
+
+                    this.peerConnection.ondatachannel = (event) => {
+                        const channel = event.channel;
+                        channel.onopen = () => {
+                            console.log('Data channel opened');                            
+                        };
+                        
+                        this.dataChannel = channel;
+                    };
+
+                    // Get user media
+                    this.mediaStream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            sampleRate: 24000,
+                            channelCount: 1,
+                            echoCancellation: true,
+                            noiseSuppression: true
+                        }
+                    });
+
+                    // Add audio track to peer connection
+                    this.mediaStream.getTracks().forEach(track => {
+                        this.peerConnection.addTrack(track, this.mediaStream);
+                    });
+
+                    // Create data channel for control messages
+                    this.dataChannel = this.peerConnection.createDataChannel('realtime', {
+                        ordered: true
+                    });
+
+                    this.dataChannel.onopen = () => {
+                        console.log('Data channel opened');                        
+                        
+                        // Send initial session configuration
+                        this.sendMessage({
+                            type: 'session.update',
+                            session: {
+                                modalities: ['text', 'audio'],
+                                instructions: 'You are a helpful assistant. Please transcribe the user\'s speech in English. Ignore anything that you do not recognize as english language',
+                                voice: 'alloy',
+                                input_audio_format: 'pcm16',
+                                output_audio_format: 'pcm16',
+                                input_audio_transcription: {
+                                    model: 'whisper-1'
+                                },
+                                turn_detection: {
+                                    type: 'server_vad',
+                                    threshold: 0.5,
+                                    prefix_padding_ms: 300,
+                                    silence_duration_ms: 200
+                                }
+                            }
+                        });
+                    };
+
+                    this.dataChannel.onmessage = (event) => {
+                        this.handleRealtimeResponse(event.data);
+                    };
+
+                    // Create offer
+                    const offer = await this.peerConnection.createOffer({
+                        offerToReceiveAudio: true,
+                        offerToReceiveVideo: false
+                    });
+
+                    await this.peerConnection.setLocalDescription(offer);
+
+                    // Send offer to Azure OpenAI via our backend proxy
+                    const response = await fetch('/api/webrtc-session', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            sdp: offer.sdp,
+                            token: this.ephemeralKey
+                        })
+                    });
+
+                    if (!response.ok) {
+                        throw new Error('Failed to establish WebRTC connection');
+                    }
+
+                    const answerSdp = await response.text();
+                    await this.peerConnection.setRemoteDescription({
+                        type: 'answer',
+                        sdp: answerSdp
+                    });
+
+                    console.log('WebRTC connection established');
+
+                } catch (error) {
+                    throw new Error('Failed to setup WebRTC: ' + error.message);
+                }
+            }
+
+            sendMessage(message) {
+                if (this.dataChannel && this.dataChannel.readyState === 'open') {
+                    this.dataChannel.send(JSON.stringify(message));
+                }
+            }
+            
+            handleRealtimeResponse(data) {
+            try {
+                const message = JSON.parse(data);
+                console.log('Received message:', message);
+                
+                switch (message.type) {
+                    case 'input_audio_buffer.speech_started':
+                        this.updateStatus('Listening...', 'connected');
+                        break;
+                    case 'input_audio_buffer.speech_stopped':
+                        this.updateStatus('Processing...', 'connected');
+                        break;
+                    case 'conversation.item.input_audio_transcription.completed':
+                        this.appendTranscription(message.transcript);
+                        break;
+                    case 'response.done':
+                        this.updateStatus('Ready - speak to continue', 'connected');
+                        break;
+                    case 'error':
+                        console.error('API Error:', message.error);
+                        this.updateStatus('Error: ' + message.error.message, 'error');
+                        break;
+                }
+            } catch (error) {
+                console.error('Error parsing response:', error);
+            }
+        }
+            
+            appendTranscription(text) {
+                this.transcription.textContent += text;
+            }
+            
+            updateStatus(message, type = '') {
+                this.status.textContent = message;
+                this.status.className = 'status ' + type;
+            }
+        }
+        
+        // Initialize the application when the page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            new RealtimeVoiceApp();
+        });
+    </script>
+</body>
+</html>
